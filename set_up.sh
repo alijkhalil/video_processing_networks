@@ -2,7 +2,7 @@
 
 # Set up variables and local directory
 UTIL_REPO_NAME="dl_utilities"
-UTIL_REPO_GIT_HASH="f45843b873cd8e8f33cd8a11d52001884c0af53e"
+UTIL_REPO_GIT_HASH="6ed7c4c8e089e28a15c32e1b8dfb071d16e2c6c2"
 
 cd `dirname $0`
 
