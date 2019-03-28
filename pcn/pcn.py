@@ -30,36 +30,81 @@ from dl_utilities.layers import pcn as pcn_layers  # Requires 'sys.path.append' 
  
     
 # Global variables
-GLOBAL_AVERAGE_POOL_STR='global'
+GLOBAL_AVG_POOL_STR='global'
+DEFAULT_WEIGHT_DECAY=1E-4
                         
 MODEL_STEM_INDEX = 0
 MODEL_NUM_STEM_CONV = 3
-
-MODEL_TIME_STEPS_P_BLOCK=np.array([1, 1, 1, 1, 3, 1, 6, 1])
 MODEL_STATES_P_BLOCK = 2
-MODEL_NUM_BLOCKS = 8
 
-assert len(MODEL_TIME_STEPS_P_BLOCK) == MODEL_NUM_BLOCKS
-MODEL_TOTAL_TIME_STEPS=np.sum(MODEL_TIME_STEPS_P_BLOCK)
-MODEL_TOTAL_STATES=(MODEL_TOTAL_TIME_STEPS * MODEL_STATES_P_BLOCK)
-             
-DEFAULT_WEIGHT_DECAY=1E-4
+MIN_STEM_LAYER_CHAN=32
+MIN_NUM_BLOCKS=2
+MIN_FINAL_DENSE_LAYERS = 2
 
 
 
 # Simple helper to get current state index based on block index
-def get_starting_state_index(block_index):
-    num_states = int(np.sum(MODEL_TIME_STEPS_P_BLOCK[:block_index]))
+def get_starting_state_index(block_index, time_steps_p_block):
+    num_states = int(np.sum(time_steps_p_block[:block_index]))
     return num_states * MODEL_STATES_P_BLOCK
+    
+# Function to get the new downsized logit dimension after a pooling operation    
+def get_downsized_dim(cur_dim, pool_dim_size):
+    return int((cur_dim + pool_dim_size - 1) // pool_dim_size)
+  
+  
+# Function to get state shapes
+def get_state_shapes(pcn_cell, input_shape):    
+    batch_size = input_shape[0]
+    init_shape = (batch_size, ) + input_shape[2:]
+    
+    state_shapes = [ ]
+    for i, num_channels in enumerate(pcn_cell.stem_plus_block_filters[:-1]):
+        start_index = get_starting_state_index(i, pcn_cell.time_steps_p_block)
+        end_index = get_starting_state_index(i+1, pcn_cell.time_steps_p_block)
+        
+        num_iters = end_index - start_index
+        for j in range(num_iters):
+            state_shapes.append(init_shape[:-1] + (num_channels, ))
+    
+    for pcn_block_i in pcn_cell.downsize_block_indices:
+        cur_i = get_starting_state_index(pcn_block_i, pcn_cell.time_steps_p_block)
+       
+        if cur_i < pcn_cell.total_states:
+            orig_shape = state_shapes[cur_i]
+            h_val = get_downsized_dim(orig_shape[1], pcn_cell.downsize_values[pcn_block_i][0])
+            w_val = get_downsized_dim(orig_shape[2], pcn_cell.downsize_values[pcn_block_i][1])
+                                
+        for i in range(cur_i, pcn_cell.total_states):
+            num_channels = state_shapes[i][-1]
+            state_shapes[i] = (batch_size, h_val, w_val, num_channels)
+            
+    return state_shapes
             
             
+# Function for getting total logits in state space to understand memory imprint of model
+def get_total_internal_state_logits(pcn_cell, input_shape):            
+    total_logits = 0
+    
+    state_shapes = get_state_shapes(pcn_cell, input_shape)
+    for cur_shape in state_shapes:        
+        additional_logits = 1
+        for i in range(len(cur_shape)):
+            if cur_shape[i] is not None:
+                additional_logits *= cur_shape[i]
+            
+        total_logits += additional_logits
+
+    return total_logits
+
+    
     
 # Predictive Corrective Network definition
 class PCN_Cell(Recurrent):
     """
     The PCN cell represents the core logic for the Predictive Corrective Network 
     model.  At a high level, the model can be expressed as an RNN with a receptive 
-    field across 6 time steps.  It is based on the underlying theory of linear 
+    field across N time steps.  It is based on the underlying theory of linear 
     dynamic systems for modeling time series involved in Kalman Filters.  
     Ultimately, the model aims to predict actions in a sequence of individual frames 
     in a video.  However, the model can be refactored to either provide a video-level 
@@ -70,17 +115,25 @@ class PCN_Cell(Recurrent):
             -particularly with high dropout rate
         -size of model and inability to train larger batches/time-series
            -requires extensive computing powers (e.g. many high-end GPUs)
+           -may require 3D average pooling to video before passing to the PCN cell
         
     # Arguments
         output_units: Positive integer
             -dimensionality of the output state space
-        block_filters: List of 9 integers
-            -output filters for convolutions in each of the 8 "blocks" (plus the initial stem)
+        stem_plus_block_filters: List of greater than MIN_NUM_BLOCKS integers
+            -output filters for the last upscaling convolution in each PCN "block" (plus the initial stem)
             -first value must be at least 32
-        downsize_block_indices: List of non-negative integers (no larger than 7) 
-            -represents indices of "blocks" requiring an initial 2x2 resolution downsize
-        final_downsize_approach: Option from the elements below
-            -None: no downsizing after 8th PCN block
+        time_steps_p_block: List of at least MIN_NUM_BLOCKS non-negative integers
+            -how many time steps back should skip connections be for each block
+            -skips that are too many time steps back, esp in early blocks, will use lots of memory
+        downsize_block_indices: List of increasing, non-negative integers
+            -represents indices of PCN "blocks" requiring an preliminary 2x2 resolution downsize
+            -values should be less than the number of PCN blocks (since the last block is handled uniquely)
+        downsize_values: List of tuples for downsizing each PCN block in the 'downsize_block_indices' list
+            -the list should be the exact same length as the 'downsize_block_indices' list
+            -will apply downsizing tuples in order (from lowest to highest index in 'downsize_block_indices' list)
+        final_downsize_approach: One of the following downsizing approaches for post-processing the last PCN block
+            -None: no downsizing after the last PCN block
             -'global': apply a global pool to reduce spatial dimensions to 1x1
             -tuple: an average pooling with that pool size (and the same stride size)
         num_conv_p_kalman_filter: Positive integer
@@ -99,9 +152,11 @@ class PCN_Cell(Recurrent):
     @interfaces.legacy_recurrent_support
     def __init__(self, 
                  output_units, 
-                 block_filters=[32, 64, 64, 128, 128, 256, 256, 512, 512],
-                 downsize_block_indices=[0, 2, 6],
-                 final_downsize_approach=GLOBAL_AVERAGE_POOL_STR,
+                 stem_plus_block_filters=[128, 256, 512, 1024],
+                 time_steps_p_block=[0, 1, 3],
+                 downsize_block_indices=[0, 1, 2],
+                 downsize_values=[(8,8), (5,5), (2,2)],
+                 final_downsize_approach=GLOBAL_AVG_POOL_STR, 
                  num_conv_p_kalman_filter=2,
                  num_res_connect_p_block=4,
                  num_final_dense_layers=3,
@@ -115,49 +170,73 @@ class PCN_Cell(Recurrent):
         if output_units is None or output_units < 0:
             raise ValueError("The 'output_units' variable must be a positive integer.")
                 
-        if type(block_filters) is not list:      
-            raise ValueError("The 'block_filters' variable must be a list.")    
-
-        if len(block_filters) != 9:
-            raise ValueError("The 'block_filters' list should contain exactly 9 items.")
+        if type(stem_plus_block_filters) is not list:      
+            raise ValueError("The 'stem_plus_block_filters' variable must be a list.")    
+    
+        if MIN_NUM_BLOCKS >= len(stem_plus_block_filters):
+            raise ValueError("The 'stem_plus_block_filters' list should contain greater than %d items." % MIN_NUM_BLOCKS)
             
-        prev_el = 16        
-        for el in block_filters:
+        if len(stem_plus_block_filters) != (len(time_steps_p_block) + 1):
+            raise ValueError("The 'time_steps_p_block' list should have one fewer element than the 'stem_plus_block_filters' list.")
+            
+        prev_el = MIN_STEM_LAYER_CHAN
+        for el in stem_plus_block_filters:
             if prev_el <= el:
                 prev_el = el
             else:    
-                raise ValueError("The 'block_filters' element values must never "
-                                    "decrease and start at a minimum of 16.")  
+                raise ValueError("The 'stem_plus_block_filters' element values must never "
+                                    "decrease and start at a minimum of %d." % MIN_STEM_LAYER_CHAN)  
             
         if type(downsize_block_indices) is not list:        
             raise ValueError("The 'downsize_blocks' variable must be a list.")
         
+        prev_el = -1
+        for el in downsize_block_indices:
+            if prev_el < el:
+                prev_el = el
+            else:
+                raise ValueError("The 'downsize_block_indices' list values must be increasing.")  
+        
         if len(np.unique(downsize_block_indices)) != len(downsize_block_indices):
             raise ValueError("The 'downsize_blocks' list should not have duplicate values.")
-
-        if num_final_dense_layers < 2:
-            raise ValueError("The 'num_final_dense_layers' value should be at least 2.")
+            
+        if type(downsize_values) is not list:        
+            raise ValueError("The 'downsize_values' variable must be a list.")
+        
+        if len((downsize_values)) != len(downsize_block_indices):
+            raise ValueError("The 'downsize_values' list should be the same size as the 'downsize_block_indices' list.")
+            
+        if num_final_dense_layers < MIN_FINAL_DENSE_LAYERS:
+            raise ValueError("The 'num_final_dense_layers' value should be at least %d." % MIN_FINAL_DENSE_LAYERS)
             
         for el in downsize_block_indices:
-            if el > 7 or el < 0:
-                raise ValueError("The 'downsize_blocks' indicies should be a maximum value of 7.")
-
+            if el >= len(time_steps_p_block) or el < 0:
+                raise ValueError("The 'downsize_blocks' indicies should be a maximum value of %d." % 
+                                    len(time_steps_p_block))
+ 
         if (final_downsize_approach is not None and 
-                final_downsize_approach != GLOBAL_AVERAGE_POOL_STR and  
+                final_downsize_approach != GLOBAL_AVG_POOL_STR and  
                 final_downsize_approach is not tuple):
-            raise ValueError("The 'final_downsize_approach' variable must be either be None, "
-                                "a tuple, or ")   
-            
+            raise ValueError("The 'final_downsize_approach' variable must be either be "
+                                "None, a tuple, or %s." % GLOBAL_AVG_POOL_STR) 
+                                
                                 
         # Assign member variables
         self.internal_layers = {}
         self.input_spec[0].ndim = 5
         
         self.output_units = output_units
-        self.block_filters = block_filters
+        self.stem_plus_block_filters = stem_plus_block_filters
+        self.model_num_blocks = len(time_steps_p_block)
         
-        self.downsize_block_indices = sorted(downsize_block_indices, key=int)
+        self.time_steps_p_block = np.array(time_steps_p_block)
+        self.total_states = int(np.sum(self.time_steps_p_block) * MODEL_STATES_P_BLOCK)
+        
+        self.downsize_block_indices = downsize_block_indices
         self.final_downsize_approach = final_downsize_approach                
+        self.downsize_values = [ None ] * self.model_num_blocks
+        for downsize_i, pcn_block_i in enumerate(downsize_block_indices):
+            self.downsize_values[pcn_block_i] = downsize_values[downsize_i]
         
         self.num_conv_p_kalman_filter = num_conv_p_kalman_filter
         self.num_res_connect_p_block = num_res_connect_p_block
@@ -391,29 +470,9 @@ class PCN_Cell(Recurrent):
         
         
         # Set state shapes
+        new_input_shape = (batch_size, ) + input_shape[1:]
         init_shape = (batch_size, ) + orig_img_dim
-        state_shapes = [ ]
-        
-        for i, num_channels in enumerate(self.block_filters[:-1]):
-            start_index = get_starting_state_index(i)
-            end_index = get_starting_state_index(i+1)
-            
-            num_iters = end_index - start_index
-            for j in range(num_iters):
-                state_shapes.append(init_shape[:-1] + (num_channels, ))
-        
-        
-        for downsize_i in self.downsize_block_indices:
-            cur_i = get_starting_state_index(downsize_i)
-            
-            orig_shape = state_shapes[cur_i]
-            h_val = int((orig_shape[1] + 1) // 2)
-            w_val = int((orig_shape[2] + 1) // 2)
-        
-            for i in range(cur_i, MODEL_TOTAL_STATES):
-                num_channels = state_shapes[i][-1]
-                state_shapes[i] = (batch_size, h_val, w_val, num_channels)
-                
+        state_shapes = get_state_shapes(self, new_input_shape)
                 
         # Set input and state spec values 
         self.input_spec = InputSpec(shape=((batch_size, None) + orig_img_dim))         
@@ -421,13 +480,13 @@ class PCN_Cell(Recurrent):
 
         
         # Initialize states to None
-        self.states = [ None ] * MODEL_TOTAL_STATES
+        self.states = [ None ] * self.total_states
         if self.stateful:
             self.reset_states()
 
             
         # Define stem layers (e.g. simple 2D conv)
-        updated_shape = init_shape[:-1] + (self.block_filters[MODEL_STEM_INDEX], )
+        updated_shape = init_shape[:-1] + (self.stem_plus_block_filters[MODEL_STEM_INDEX], )
         num_channels = updated_shape[-1]
         
         for i in range(MODEL_NUM_STEM_CONV):
@@ -451,31 +510,30 @@ class PCN_Cell(Recurrent):
             
             tmp_layer = BatchNormalization(name=weight_name)
             
-            self.add_layer(tmp_layer, layer_id, updated_shape)                                                                 
+            self.add_layer(tmp_layer, layer_id, updated_shape)
         
         
-        # Add layers for remaining blocks
-        next_channels = 0
+        # Add layers for remaining blocks 
+        cur_shape = updated_shape
         
-        for i in range(MODEL_NUM_BLOCKS):
+        for i in range(self.model_num_blocks):
             # Get number of channels for the block
-            cur_shape = state_shapes[get_starting_state_index(i)]
-            num_channels = cur_shape[-1]
-            
-            is_last = False
-            if (i+1) == MODEL_NUM_BLOCKS:
-                is_last = True
-            else:
-                next_state_i = get_starting_state_index(i+1)
-                next_channels = state_shapes[next_state_i][-1]
+            num_channels = self.stem_plus_block_filters[i]
+            if i in self.downsize_block_indices:
+                h = get_downsized_dim(cur_shape[1], self.downsize_values[i][0])
+                w = get_downsized_dim(cur_shape[2], self.downsize_values[i][1])
+                
+            cur_shape = (cur_shape[0], h, w, num_channels)            
+            next_channels = self.stem_plus_block_filters[i+1]
             
             
             # Tanh layer function used to modulate activations between time steps
-            weight_name = ('tanh_weights_%d' % i) 
-            layer_id = ('tanh_layer_%d' % i) 
+            if self.time_steps_p_block[i]:
+                weight_name = ('tanh_weights_%d' % i) 
+                layer_id = ('tanh_layer_%d' % i) 
 
-            tmp_layer = pcn_layers.GetTanhValue(name=weight_name)
-            self.add_layer(tmp_layer, layer_id, cur_shape)            
+                tmp_layer = pcn_layers.GetTanhValue(name=weight_name)
+                self.add_layer(tmp_layer, layer_id, cur_shape)            
             
             
             # Conv weights operating on the difference between time steps
@@ -492,7 +550,7 @@ class PCN_Cell(Recurrent):
                 self.add_layer(tmp_layer, layer_id, cur_shape)
         
                 # Define Batch Norm layers
-                weight_name = ('kalman_bn_kernel_%d_%d' % (i, j)) 
+                weight_name = ('kalman_bn_kernel_%d_%d' % (i, j))
                 layer_id = ('kalman_bn_layer_%d_%d' % (i, j))
                 
                 tmp_layer = BatchNormalization(name=weight_name)
@@ -543,48 +601,46 @@ class PCN_Cell(Recurrent):
 
                 
             # Final convolution to upscale number of filters if needed
-            if not is_last:
-                weight_name = ('final_conv_kernel_%d' % i) 
-                layer_id = ('final_conv_layer_%d' % i)
-                
-                tmp_layer = SeparableConv2D(next_channels, (3, 3), kernel_initializer='he_uniform', 
-                                                padding='same', use_bias=False, 
-                                                kernel_regularizer=l2(DEFAULT_WEIGHT_DECAY), 
-                                                name=weight_name)
-                                        
-                self.add_layer(tmp_layer, layer_id, cur_shape)
+            weight_name = ('final_conv_kernel_%d' % i) 
+            layer_id = ('final_conv_layer_%d' % i)
+            
+            tmp_layer = SeparableConv2D(next_channels, (3, 3), kernel_initializer='he_uniform', 
+                                            padding='same', use_bias=False, 
+                                            kernel_regularizer=l2(DEFAULT_WEIGHT_DECAY), 
+                                            name=weight_name)
+                                    
+            self.add_layer(tmp_layer, layer_id, cur_shape)
             
             
         # Add final 'num_final_dense_layers' Dense layers
-        final_shape = state_shapes[-1][1:]
-        if self.final_downsize_approach is not None:
-            if self.final_downsize_approach == GLOBAL_AVERAGE_POOL_STR:
-                final_shape = (1, 1, final_shape[2])
-            else:
-                h_val = final_shape[0] // self.final_downsize_approach[0]
-                w_val = final_shape[1] // self.final_downsize_approach[1]
-                final_shape = (h_val, w_val, final_shape[2])
+        final_shape = cur_shape[:-1] + (next_channels, )
         
+        if self.final_downsize_approach is not None:
+            if self.final_downsize_approach != GLOBAL_AVG_POOL_STR:
+                h_val = get_downsized_dim(final_shape[1], self.final_downsize_approach[0])
+                w_val = get_downsized_dim(final_shape[2], self.final_downsize_approach[1])
+                
+                final_shape = (h_val, w_val, final_shape[-1])
+            else:
+                final_shape = (1, 1, final_shape[-1])
+
         final_channels = 1
         for dim in final_shape:
             final_channels *= dim
-            
-        flattened_shape = (batch_size, final_channels)
-        
+                    
         diff = int((self.output_units - final_channels) // 2)
         intermediate_channels = final_channels + diff
         self.intermediate_shape = (batch_size, intermediate_channels)
         
-        
         for i in range(self.num_final_dense_layers - 1):
-            weight_name = ('final_dense_kernel_%d' % i) 
+            weight_name = ('final_dense_kernel_%d' % i)
             layer_id = ('final_dense_layer_%d' % i)
             
             tmp_layer = Dense(intermediate_channels, use_bias=False, 
                                             kernel_regularizer=l2(DEFAULT_WEIGHT_DECAY), 
                                             name=weight_name)
             if i == 0:                         
-                self.add_layer(tmp_layer, layer_id, flattened_shape)
+                self.add_layer(tmp_layer, layer_id, (batch_size, final_channels))
             else:
                 self.add_layer(tmp_layer, layer_id, self.intermediate_shape)
                 
@@ -651,28 +707,29 @@ class PCN_Cell(Recurrent):
             
             if (i+1) == MODEL_NUM_STEM_CONV:
                 if MODEL_STEM_INDEX in self.downsize_block_indices:
-                    stem = AveragePooling2D()(stem)
+                    stem = AveragePooling2D(pool_size=self.downsize_values[MODEL_STEM_INDEX], 
+                                                padding='same')(stem)
             else:
-                stem = Activation('relu')(stem)        
-                
-        new_states.append(stem)
+                stem = Activation('relu')(stem)        # JADO - consider changing to swish activation
         
-        
+            
         # Pass through PCN "blocks"    
         x = stem
-        for i in range(MODEL_NUM_BLOCKS):
-            # Get subtraction value
-            start_index = get_starting_state_index(i)
+        for i in range(self.model_num_blocks):
+            # Get subtraction value            
+            if self.time_steps_p_block[i]:
+                start_index = get_starting_state_index(i, self.time_steps_p_block)
 
-            norm_stem = pcn_layers.NormalizePerChannel()(x)
-            norm_prev_stem = pcn_layers.NormalizePerChannel()(core_states[start_index])
-            x = dl_layers.Subtract()([norm_stem, norm_prev_stem])
-
-            
-            # Get tanh-based scalar value (for each example in batch)
-            tanh_layer_id = ('tanh_layer_%d' % i) 
-            tahn_output = self.get_layer(tanh_layer_id)(x)
-            
+                norm_stem = pcn_layers.NormalizePerChannel()(x)                
+                x = dl_layers.Subtract()([norm_stem, core_states[start_index]])
+                
+                # Get tanh-based scalar value (for each example in batch)
+                tanh_layer_id = ('tanh_layer_%d' % i) 
+                tahn_output = self.get_layer(tanh_layer_id)(x)
+                
+                new_states.append(norm_stem)
+            else:
+                x = Activation('relu')(x)
             
             # Pass substract layer through the Kalman filter MLP
             for j in range(self.num_conv_p_kalman_filter):
@@ -681,16 +738,16 @@ class PCN_Cell(Recurrent):
                 
                 x = self.get_layer(conv_layer_id)(x)
                 x = self.get_layer(bn_layer_id)(x)
-                if (j+1) != self.num_conv_p_kalman_filter:
+                if (j+1) != self.num_conv_p_kalman_filter:      
                     x = Activation('relu')(x)
-                        
-            new_states.append(x)
             
             
             # Get addition combinition of two time steps (based on tanh value)
-            x = pcn_layers.GetTanhCombination()([tahn_output, x, core_states[start_index+1]])
-            
-            
+            if self.time_steps_p_block[i]:
+                x = pcn_layers.GetTanhCombination()([tahn_output, x, core_states[start_index+1]])
+                new_states.append(x)
+
+                
             # Post processing residual connections (after addition)
             for j in range(self.num_res_connect_p_block):                
                 conv_layer_id_1 = ('res_conv_layer_%d_%d_1' % (i, j))
@@ -709,23 +766,23 @@ class PCN_Cell(Recurrent):
                 x = Add()([x, res_term])
             
             
-            # Final convolution and to upscale number of filters if needed
-            if (i+1) != MODEL_NUM_BLOCKS:
-                conv_layer_id = ('final_conv_layer_%d' % i)
-                x = self.get_layer(conv_layer_id)(x)
-                                
-                if (i+1) in self.downsize_block_indices:
-                    x = AveragePooling2D()(x)
+            # Final convolution to upscale number of filters if needed
+            conv_layer_id = ('final_conv_layer_%d' % i)
             
-                new_states.append(x)            
-                            
+            x = Activation('relu')(x)
+            x = self.get_layer(conv_layer_id)(x)
+            
+            if (i+1) in self.downsize_block_indices:
+                x = AveragePooling2D(pool_size=self.downsize_values[i+1], padding='same')(x)
+            
             
         # Downsize final convolution layer if needed
         if self.final_downsize_approach is not None:
-            if self.final_downsize_approach == GLOBAL_AVERAGE_POOL_STR:
-                x = GlobalAveragePooling2D()(x)
+            if self.final_downsize_approach != GLOBAL_AVG_POOL_STR:
+                x = AveragePooling2D(pool_size=self.final_downsize_approach, 
+                                        padding='same')(x)
             else:
-                x = AveragePooling2D(self.final_downsize_approach)(x)
+                x = GlobalAveragePooling2D()(x)
             
         
         # Apply final fully connected layers    
@@ -734,18 +791,19 @@ class PCN_Cell(Recurrent):
     
         for i in range(self.num_final_dense_layers):
             final_layer_id = ('final_dense_layer_%d' % i)
-            
             final_output = self.get_layer(final_layer_id)(x)
             
             if (i+1) != self.num_final_dense_layers:
                 x = Activation('relu')(final_output)
+                
                 if 0.0 < self.dropout:
                     x = x * dp_mask
         
+        
         # Re-organize old states and add new ones
-        for i in range(MODEL_NUM_BLOCKS):
-            start_i = get_starting_state_index(i)
-            next_i = get_starting_state_index(i+1)
+        for i in range(self.model_num_blocks):
+            start_i = get_starting_state_index(i, self.time_steps_p_block)
+            next_i = get_starting_state_index(i+1, self.time_steps_p_block)
             
             cur_time_end_i = next_i - MODEL_STATES_P_BLOCK
             prev_time_start_i = start_i + MODEL_STATES_P_BLOCK
@@ -765,7 +823,7 @@ class PCN_Cell(Recurrent):
         
     def get_config(self):    
         config = {'output_units': self.output_units,
-                  'block_filters': self.block_filters,
+                  'stem_plus_block_filters': self.stem_plus_block_filters,
                   'downsize_block_indices': self.downsize_block_indices,
                   'final_downsize_approach': self.final_downsize_approach,
                   'num_conv_p_kalman_filter': self.num_conv_p_kalman_filter,
@@ -783,20 +841,17 @@ class PCN_Cell(Recurrent):
         
         
 ################ MAIN ################
+'''
+#https://github.com/achalddave/predictive-corrective
+#https://github.com/achalddave/predictive-corrective/blob/master/download.sh
+#https://github.com/achalddave/thumos-scripts/blob/master/parse_temporal_annotations_to_hdf5.py
+#http://www.thumos.info/download.html
+
 if __name__ == '__main__':
 
     time_steps = 20
     img_dimensions = (32, 32, 3)
     num_labels = 100
-
-    '''
-    https://github.com/achalddave/predictive-corrective
-
-    https://github.com/achalddave/predictive-corrective/blob/master/download.sh
-    https://github.com/achalddave/thumos-scripts/blob/master/parse_temporal_annotations_to_hdf5.py
-
-    http://www.thumos.info/download.html
-    '''       
     
     input = Input((time_steps, ) + img_dimensions)
 
@@ -811,3 +866,4 @@ if __name__ == '__main__':
 
     model.summary()                         
     print("Done.")
+'''
